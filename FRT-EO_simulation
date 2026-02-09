@@ -1,1 +1,418 @@
+###############################################################################
+######################### SIMULATION - PIECEWISE ONLY #########################
+###############################################################################
 
+library(data.table)
+library(rpart)
+library(party)
+library(Cubist)
+library(Metrics)
+
+###############################################################################
+# 1) TFN (Triangular Fuzzy Number) helper functions
+###############################################################################
+
+tfn_add <- function(A, B) c(A[1] + B[1], A[2] + B[2], A[3] + B[3])
+
+tfn_subtract <- function(A, B) {
+  # A - B = (a1 - b3, a2 - b2, a3 - b1)
+  c(A[1] - B[3], A[2] - B[2], A[3] - B[1])
+}
+
+tfn_multiply <- function(A, B) {
+  products <- c(A[1]*B[1], A[1]*B[3], A[3]*B[1], A[3]*B[3])
+  c(min(products), A[2]*B[2], max(products))
+}
+
+tfn_divide <- function(A, B) {
+  if (any(B == 0)) stop("TFN division: denominator has 0 component.")
+  quotients <- c(A[1]/B[1], A[1]/B[3], A[3]/B[1], A[3]/B[3])
+  c(min(quotients), A[2]/B[2], max(quotients))
+}
+
+tfn_scalar_multiply <- function(scalar, A) {
+  products <- scalar * A
+  if (scalar >= 0) products else c(products[3], products[2], products[1])
+}
+
+tfn_sum <- function(TFNs) {
+  a_sum <- sum(sapply(TFNs, `[[`, 1))
+  b_sum <- sum(sapply(TFNs, `[[`, 2))
+  c_sum <- sum(sapply(TFNs, `[[`, 3))
+  c(a_sum, b_sum, c_sum)
+}
+
+tfn_mean <- function(TFNs) {
+  n <- length(TFNs)
+  s <- tfn_sum(TFNs)
+  c(s[1]/n, s[2]/n, s[3]/n)
+}
+
+tfn_square <- function(A) c(A[1]^2, A[2]^2, A[3]^2)
+
+calculate_sse_tfn <- function(TFNs) {
+  n <- length(TFNs)
+  if (n <= 1) return(c(0,0,0))
+  mean_tfn <- tfn_mean(TFNs)
+  
+  squared_diffs <- lapply(TFNs, function(y) {
+    diff <- tfn_subtract(y, mean_tfn)
+    tfn_square(diff)
+  })
+  
+  sum_sq_diffs <- tfn_sum(squared_diffs)
+  tfn_scalar_multiply(1/(n - 1), sum_sq_diffs)
+}
+
+# GMIR (the defuzzification structure you are using)
+gmir_distance <- function(A, B) {
+  P_A <- (A[1] + 4*A[2] + A[3]) / 6
+  P_B <- (B[1] + 4*B[2] + B[3]) / 6
+  abs(P_A - P_B)
+}
+
+calculate_lambda_t <- function(Y_prev, U_prev) {
+  diff <- abs(tfn_subtract(Y_prev, U_prev))
+  one_plus_diff <- tfn_add(c(1,1,1), diff)
+  inv_one_plus_diff <- tfn_divide(c(1,1,1), one_plus_diff)
+  tfn_subtract(c(1,1,1), inv_one_plus_diff)
+}
+
+calculate_split_score <- function(SSE_TFN, lambda_TFN, d_s) {
+  weighted_lambda <- tfn_scalar_multiply(d_s, lambda_TFN)
+  split_score_tfn <- tfn_add(SSE_TFN, weighted_lambda)
+  
+  # defuzz
+  score <- (split_score_tfn[1] + 4*split_score_tfn[2] + split_score_tfn[3]) / 6
+  if (is.na(score) || is.nan(score)) return(Inf)
+  score
+}
+
+###############################################################################
+# 2) Fuzzy Tree: find split + build tree + prediction
+###############################################################################
+
+find_best_split <- function(data, features, expert_TFN, prev_year_real_TFN, prev_year_expert_TFN) {
+  
+  best_score <- Inf
+  best_feature <- NULL
+  best_threshold <- NULL
+  
+  lambda_t <- calculate_lambda_t(prev_year_real_TFN, prev_year_expert_TFN)
+  
+  for (feature in features) {
+    values <- sort(unique(data[[feature]]))
+    if (length(values) < 2) next
+    thresholds <- (values[-1] + values[-length(values)]) / 2
+    
+    for (threshold in thresholds) {
+      left_idx  <- which(data[[feature]] <= threshold)
+      right_idx <- which(data[[feature]] >  threshold)
+      if (length(left_idx) == 0 || length(right_idx) == 0) next
+      
+      left_TFNs  <- lapply(left_idx,  function(i) data$Y_TFN[[i]])
+      right_TFNs <- lapply(right_idx, function(i) data$Y_TFN[[i]])
+      
+      sse_left  <- calculate_sse_tfn(left_TFNs)
+      sse_right <- calculate_sse_tfn(right_TFNs)
+      
+      n_left  <- length(left_idx)
+      n_right <- length(right_idx)
+      n_total <- n_left + n_right
+      
+      weighted_sse <- tfn_add(
+        tfn_scalar_multiply(n_left / n_total,  sse_left),
+        tfn_scalar_multiply(n_right / n_total, sse_right)
+      )
+      
+      mean_left  <- tfn_mean(left_TFNs)
+      mean_right <- tfn_mean(right_TFNs)
+      mean_group <- tfn_add(
+        tfn_scalar_multiply(n_left / n_total,  mean_left),
+        tfn_scalar_multiply(n_right / n_total, mean_right)
+      )
+      
+      d_s <- gmir_distance(mean_group, expert_TFN)
+      score <- calculate_split_score(weighted_sse, lambda_t, d_s)
+      
+      if (!is.na(score) && !is.nan(score) && score < best_score) {
+        best_score <- score
+        best_feature <- feature
+        best_threshold <- threshold
+      }
+    }
+  }
+  
+  list(feature = best_feature, threshold = best_threshold, score = best_score)
+}
+
+build_fuzzy_regression_tree <- function(data, features, expert_TFN,
+                                        prev_year_real_TFN, prev_year_expert_TFN,
+                                        max_depth = 3, min_samples_split = 3, current_depth = 0) {
+  
+  # Stopping conditions
+  if (current_depth >= max_depth || nrow(data) < min_samples_split) {
+    return(list(
+      is_leaf = TRUE,
+      prediction = tfn_mean(data$Y_TFN),
+      samples = nrow(data),
+      depth = current_depth
+    ))
+  }
+  
+  # Find the best split
+  best_split <- find_best_split(data, features, expert_TFN, prev_year_real_TFN, prev_year_expert_TFN)
+  
+  if (is.null(best_split$feature)) {
+    # If no split is found, create a leaf node
+    return(list(
+      is_leaf = TRUE,
+      prediction = tfn_mean(data$Y_TFN),
+      samples = nrow(data),
+      depth = current_depth
+    ))
+  }
+  
+  f <- best_split$feature
+  th <- best_split$threshold
+  
+  # Split the data into two parts
+  left_data  <- data[data[[f]] <= th]
+  right_data <- data[data[[f]] >  th]
+  
+  left_subtree <- build_fuzzy_regression_tree(
+    left_data, features, expert_TFN,
+    prev_year_real_TFN, prev_year_expert_TFN,
+    max_depth, min_samples_split, current_depth + 1
+  )
+  right_subtree <- build_fuzzy_regression_tree(
+    right_data, features, expert_TFN,
+    prev_year_real_TFN, prev_year_expert_TFN,
+    max_depth, min_samples_split, current_depth + 1
+  )
+  
+  list(
+    is_leaf = FALSE,
+    feature = f,
+    threshold = th,
+    left = left_subtree,
+    right = right_subtree,
+    samples = nrow(data),
+    depth = current_depth
+  )
+}
+
+predict_fuzzy_tree <- function(tree, observation) {
+  if (tree$is_leaf) return(tree$prediction)
+  if (observation[[tree$feature]] <= tree$threshold) {
+    predict_fuzzy_tree(tree$left, observation)
+  } else {
+    predict_fuzzy_tree(tree$right, observation)
+  }
+}
+
+predict_fuzzy_tree_dataset <- function(tree, data) {
+  lapply(1:nrow(data), function(i) predict_fuzzy_tree(tree, data[i, ]))
+}
+
+###############################################################################
+# 3) Simulation function (piecewise)
+###############################################################################
+
+run_simulation_piecewise <- function(X_fixed,
+                                     n = 500,
+                                     outlier_rate = 0.10,
+                                     noise_sd = 10,
+                                     n_repeats = 50,
+                                     split_ratios = c(0.7, 0.8, 0.9),
+                                     seed = 123,
+                                     max_depth = 3,
+                                     min_samples_split = 3) {
+  
+  set.seed(seed)
+  p <- ncol(X_fixed)
+  results_all <- data.table()
+  
+  fuzzify_crisp <- function(x, delta_percent = 0.05) {
+    delta <- x * delta_percent
+    c(x - delta, x, x + delta)
+  }
+  
+  for (split_ratio in split_ratios) {
+    split_label <- paste0(split_ratio * 100, "/", (1 - split_ratio) * 100)
+    
+    for (rep in 1:n_repeats) {
+      
+      # Fixed X structure (first n rows)
+      X <- X_fixed[1:n, , drop = FALSE]
+      
+      # Generate piecewise Y
+      epsilon <- rnorm(n, mean = 0, sd = noise_sd)
+      X1 <- X[, 1]; X2 <- X[, 2]; X3 <- X[, 3]; X4 <- X[, 4]
+      
+      Y <- numeric(n)
+      idx1 <- which(X1 < 0 & X4 > 0)
+      idx2 <- which(X1 < 0 & X4 <= 0)
+      idx3 <- which(X1 >= 0 & X4 > 0)
+      idx4 <- which(X1 >= 0 & X4 <= 0)
+      
+      Y[idx1] <- -2 * X1[idx1] + X2[idx1] + X4[idx1]^2 + epsilon[idx1]
+      Y[idx2] <- -2 * X1[idx2] + X2[idx2] - X4[idx2]   + epsilon[idx2]
+      Y[idx3] <-  2 * X1[idx3] + X3[idx3] + X4[idx3]^2 + epsilon[idx3]
+      Y[idx4] <-  2 * X1[idx4] + X3[idx4] - X4[idx4]   + epsilon[idx4]
+      
+      # Keep Y positive
+      if (min(Y) < 10) Y <- Y + (10 - min(Y))
+      
+      # Add outliers
+      if (outlier_rate > 0) {
+        outlier_idx <- sample(1:n, size = ceiling(n * outlier_rate))
+        Y[outlier_idx] <- Y[outlier_idx] + 500
+      }
+      
+      # Data
+      dt <- as.data.table(X)
+      setnames(dt, paste0("X", 1:p))
+      dt[, Y_crisp := Y]
+      
+      # Generate TFNs
+      Y_TFN_mat <- t(sapply(dt$Y_crisp, fuzzify_crisp))
+      colnames(Y_TFN_mat) <- c("Y_TFN_a", "Y_TFN_b", "Y_TFN_c")
+      dt <- cbind(dt, Y_TFN_mat)
+      dt[, Y_TFN := lapply(1:.N, function(i) c(Y_TFN_a[i], Y_TFN_b[i], Y_TFN_c[i]))]
+      
+      # Generate expert TFNs (example scenario)
+      expert_shift <- sample(c(-120, -80, 50, 100), n, replace = TRUE)
+      dt[, Expert_Center := Y_crisp + expert_shift]
+      dt[, Expert_Lower  := Expert_Center - 30]
+      dt[, Expert_Upper  := Expert_Center + 30]
+      dt[, expert_TFN := paste0("(", Expert_Lower, ", ", Expert_Center, ", ", Expert_Upper, ")")]
+      dt[, expert_TFN_parsed := lapply(expert_TFN, function(s)
+        as.numeric(unlist(regmatches(s, gregexpr("[0-9.-]+", s)))))
+      ]
+      
+      # Train/Test split
+      train_idx <- sample(1:n, size = floor(split_ratio * n))
+      train_data <- dt[train_idx]
+      test_data  <- dt[-train_idx]
+      features <- paste0("X", 1:p)
+      
+      # Train the fuzzy tree
+      expert_TFN <- train_data$expert_TFN_parsed[[1]]
+      prev_real  <- train_data$Y_TFN[[1]]
+      prev_exp   <- train_data$expert_TFN_parsed[[1]]
+      
+      fuzzy_tree <- build_fuzzy_regression_tree(
+        train_data, features, expert_TFN,
+        prev_real, prev_exp,
+        max_depth = max_depth, min_samples_split = min_samples_split
+      )
+      
+      # Fuzzy Tree prediction + defuzzification
+      pred_train <- predict_fuzzy_tree_dataset(fuzzy_tree, train_data)
+      pred_test  <- predict_fuzzy_tree_dataset(fuzzy_tree, test_data)
+      
+      pred_train_mat <- do.call(rbind, pred_train)
+      pred_test_mat  <- do.call(rbind, pred_test)
+      
+      pred_crisp_train <- (pred_train_mat[,1] + 4*pred_train_mat[,2] + pred_train_mat[,3]) / 6
+      pred_crisp_test  <- (pred_test_mat[,1]  + 4*pred_test_mat[,2]  + pred_test_mat[,3])  / 6
+      
+      true_y_train <- train_data$Y_crisp
+      true_y_test  <- test_data$Y_crisp
+      
+      # Other models
+      cart_model   <- rpart(Y_crisp ~ ., data = train_data[, c(features, "Y_crisp"), with = FALSE])
+      guide_model  <- ctree(Y_crisp ~ ., data = train_data[, c(features, "Y_crisp"), with = FALSE])
+      cubist_model <- cubist(x = train_data[, ..features], y = train_data$Y_crisp)
+      
+      cart_pred_train   <- predict(cart_model,   newdata = train_data)
+      guide_pred_train  <- predict(guide_model,  newdata = train_data)
+      cubist_pred_train <- predict(cubist_model, newdata = train_data)
+      
+      cart_pred_test   <- predict(cart_model,   newdata = test_data)
+      guide_pred_test  <- predict(guide_model,  newdata = test_data)
+      cubist_pred_test <- predict(cubist_model, newdata = test_data)
+      
+      # Store results
+      models <- c("Fuzzy Tree", "CART", "GUIDE", "Cubist")
+      for (i in 1:4) {
+        
+        if (i == 1) { train_pred <- pred_crisp_train; test_pred <- pred_crisp_test }
+        if (i == 2) { train_pred <- cart_pred_train;  test_pred <- cart_pred_test  }
+        if (i == 3) { train_pred <- guide_pred_train; test_pred <- guide_pred_test }
+        if (i == 4) { train_pred <- cubist_pred_train;test_pred <- cubist_pred_test }
+        
+        results_all <- rbind(results_all, data.table(
+          Split = split_label, Repeat = rep, Model = models[i], Dataset = "Train",
+          MAE = mae(true_y_train, train_pred),
+          RMSE = rmse(true_y_train, train_pred),
+          MSE = mse(true_y_train, train_pred)
+        ))
+        
+        results_all <- rbind(results_all, data.table(
+          Split = split_label, Repeat = rep, Model = models[i], Dataset = "Test",
+          MAE = mae(true_y_test, test_pred),
+          RMSE = rmse(true_y_test, test_pred),
+          MSE = mse(true_y_test, test_pred)
+        ))
+      }
+    }
+  }
+  
+  results_all
+}
+
+###############################################################################
+# 4) Example runs - based on paper 
+###############################################################################
+
+# n=50
+set.seed(42)
+X_fixed_50 <- matrix(runif(50 * 4, min = -100, max = 100), ncol = 4)
+results_n_50_out_0    <- run_simulation_piecewise(X_fixed_50, n=50,  outlier_rate=0.00, noise_sd=10, n_repeats=50)
+results_n_50_out_0_05 <- run_simulation_piecewise(X_fixed_50, n=50,  outlier_rate=0.05, noise_sd=10, n_repeats=50)
+results_n_50_out_0_35 <- run_simulation_piecewise(X_fixed_50, n=50,  outlier_rate=0.35, noise_sd=10, n_repeats=50)
+
+# n=300
+set.seed(42)
+X_fixed_300 <- matrix(runif(300 * 4, min = -100, max = 100), ncol = 4)
+results_n_300_out_0    <- run_simulation_piecewise(X_fixed_300, n=300, outlier_rate=0.00, noise_sd=10, n_repeats=50)
+results_n_300_out_0_05 <- run_simulation_piecewise(X_fixed_300, n=300, outlier_rate=0.05, noise_sd=10, n_repeats=50)
+results_n_300_out_0_35 <- run_simulation_piecewise(X_fixed_300, n=300, outlier_rate=0.35, noise_sd=10, n_repeats=50)
+
+# n=1500
+set.seed(42)
+X_fixed_1500 <- matrix(runif(1500 * 4, min = -100, max = 100), ncol = 4)
+results_n_1500_out_0    <- run_simulation_piecewise(X_fixed_1500, n=1500, outlier_rate=0.00, noise_sd=10, n_repeats=50)
+results_n_1500_out_0_05 <- run_simulation_piecewise(X_fixed_1500, n=1500, outlier_rate=0.05, noise_sd=10, n_repeats=50)
+results_n_1500_out_0_35 <- run_simulation_piecewise(X_fixed_1500, n=1500, outlier_rate=0.35, noise_sd=10, n_repeats=50)
+
+# n=5000
+set.seed(42)
+X_fixed_5000 <- matrix(runif(5000 * 4, min = -100, max = 100), ncol = 4)
+results_n_5000_out_0    <- run_simulation_piecewise(X_fixed_5000, n=5000, outlier_rate=0.00, noise_sd=10, n_repeats=50)
+results_n_5000_out_0_05 <- run_simulation_piecewise(X_fixed_5000, n=5000, outlier_rate=0.05, noise_sd=10, n_repeats=50)
+results_n_5000_out_0_35 <- run_simulation_piecewise(X_fixed_5000, n=5000, outlier_rate=0.35, noise_sd=10, n_repeats=50)
+
+###############################################################################
+# 5) Optional: Save results
+###############################################################################
+# install.packages("writexl")
+library(writexl)
+
+write_xlsx(results_n_50_out_0,       "results_n_50_out_0.xlsx")
+write_xlsx(results_n_50_out_0_05,    "results_n_50_out_0_05.xlsx")
+write_xlsx(results_n_50_out_0_35,    "results_n_50_out_0_35.xlsx")
+
+write_xlsx(results_n_300_out_0,      "results_n_300_out_0.xlsx")
+write_xlsx(results_n_300_out_0_05,   "results_n_300_out_0_05.xlsx")
+write_xlsx(results_n_300_out_0_35,   "results_n_300_out_0_35.xlsx")
+
+write_xlsx(results_n_1500_out_0,     "results_n_1500_out_0.xlsx")
+write_xlsx(results_n_1500_out_0_05,  "results_n_1500_out_0_05.xlsx")
+write_xlsx(results_n_1500_out_0_35,  "results_n_1500_out_0_35.xlsx")
+
+write_xlsx(results_n_5000_out_0,     "results_n_5000_out_0.xlsx")
+write_xlsx(results_n_5000_out_0_05,  "results_n_5000_out_0_05.xlsx")
+write_xlsx(results_n_5000_out_0_35,  "results_n_5000_out_0_35.xlsx")
